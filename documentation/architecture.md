@@ -2,14 +2,14 @@
 
 ## High-Level Architecture
 
-![Event Processor Architecture](./diagrams/EventProcessor.png)
+![Event Processor Architecture](./diagram/EventProcessor.png)
 
 The event processor consists of three components that help it receive, process and persist events respectively:
 
 #### 1) Event Queue (AWS SQS)
 - This receives the events and channels them to the lambda function for processing in no particular order. 
 - The batch-size for processing queued events can be configured based on expected throughput. For low throughput workload, a lower batch-size like 1-2 helps keep end-to-end latency low. For high throughput workloads the batch-size may be increased to 5-10. 
-- If lambda fails to process any event due to any error, it is retried for a configurable number of times and then sent to Dead Letter Queue (DLQ).
+- If lambda fails to process any event due to any error, it is retried for a configurable number of times and then sent to Dead Letter Queue (DLQ). DLQ helps identify invalid/failed events and helps raise alert via CloudWatch alarm so issues can be discovered and investigated quickly.
 - Message queue was chosen to receive the events to allow decoupled and asynchronous communication between producers and event processor.
 
 __Integration with Producer__
@@ -47,9 +47,22 @@ __Integration with `Sender`__
 
 ## Considerations
 
+### Event Validation
+- Currently, the received Event is validated to ensure non-empty fields, expected generic event structure conformation, and supported event type. 
+- The `data` field of event is expected to hold event's type-specific payload, the schemas for which aren't validated currently.
+- To add support for event's type specific payload, the schemas can be stored and fetched from an object storage such as S3 bucket and the `data` field can be validated against the schema for that specific type.
+
+## Infrastructure-As-Code (IaC)
+- To implement Infrastructure-As-Code, all cloud resources have been defined to be provisioned via AWS SAM CloudFormation template. AWS SAM is used here as it builds on top of CloudFormation with simplified syntax for serverless resources.
+- LocalStack is supported for local development and testing. LocalStack is an AWS Cloud emulator which runs as a Docker container. It's a cost-free way to deploy and test AWS Cloud solutions locally.
+
 ### Security
+- All data at rest is encrypted with a customer-managed KMS key (CMK) to ensure security.
+- All resources are granted minimal permissions required to interact with each other based on their use-case, following the principles of least privilege.
 
 ### Monitoring and Alerts
+- CloudWatch Alarms are setup for lambda errors and DLQ messages. 
+- In future, these alarms can be be used to notify (email etc.) via SNS.
 
 
 

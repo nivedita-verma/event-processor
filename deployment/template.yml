@@ -1,0 +1,277 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Event Processor (SAM) - SQS -> Lambda -> DynamoDB with KMS + monitoring
+
+Globals:
+  Function:
+    Runtime: provided.al2023
+    Architectures:
+      - x86_64
+    Timeout: 10
+    MemorySize: 256
+
+Parameters:
+  EventMaxReceiveCount:
+    Type: String
+    Description: Maximum receive count an event can have for the SQS queue before being sent to the DLQ
+    Default: 5
+
+Resources:
+
+  # KMS CMK for encrypting resources at rest
+  EventKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: CMK for Event Processor resources (SQS, DynamoDB, Lambda)
+      EnableKeyRotation: true
+
+  EventKMSAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: alias/event-processor-key
+      TargetKeyId: !Ref EventKMSKey
+
+  # Event Receiving SQS queue + DLQ
+  EventQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: event-queue
+      KmsMasterKeyId: !Ref EventKMSKey
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt EventDLQ.Arn
+        maxReceiveCount: !Ref EventMaxReceiveCount
+  
+  EventDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: event-dlq
+      KmsMasterKeyId: !Ref EventKMSKey
+
+  # DynamoDB table for storing events
+  EventTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: event-table
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: ClientID
+          AttributeType: S
+        - AttributeName: EventID
+          AttributeType: S
+      KeySchema:
+        - AttributeName: ClientID
+          KeyType: HASH
+        - AttributeName: EventID
+          KeyType: RANGE
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS    
+        KMSMasterKeyId: !Ref EventKMSKey
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+  
+  EventTableReadPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: event-table-read-policy
+      Description: Read-only access to Event Table
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - dynamodb:GetItem
+              - dynamodb:BatchGetItem
+              - dynamodb:Query
+              - dynamodb:Scan
+            Resource: !GetAtt EventTable.Arn
+          - Effect: Allow
+            Action:
+              - kms:Decrypt
+              - kms:Encrypt
+              - kms:GenerateDataKey
+            Resource: !GetAtt EventKMSKey.Arn
+
+  # Lambda function to process events from SQS and write to DynamoDB
+  EventProcessorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: event-processor
+      Handler: bootstrap
+      CodeUri: ../build/event-processor         
+      Role: !GetAtt EventProcessorRole.Arn
+      Environment:
+        Variables:
+          EVENTS_TABLE_NAME: !Ref EventTable
+      Events:
+        SQSEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt EventQueue.Arn
+            BatchSize: 1
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
+      Tracing: Active
+
+  EventProcessorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: event-processor-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: EventProcessorFullPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                Resource: !GetAtt EventTable.Arn
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt EventQueue.Arn
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:Encrypt
+                  - kms:GenerateDataKey
+                Resource: !GetAtt EventKMSKey.Arn
+
+  # CloudWatch Alarm - Lambda errors
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: EventProcessor-Lambda-Errors
+      AlarmDescription: "Alarm when EventProcessor Lambda records errors"
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref EventProcessorFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: missing
+
+  # CloudWatch Alarm - DLQ message count (visible)
+  DLQAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: EventProcessor-DLQ-Messages
+      AlarmDescription: "Alarm when DLQ has visible messages"
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt EventDLQ.QueueName
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  # CloudWatch Dashboard (simple)
+  # EventProcessorDashboard:
+  #   Type: AWS::CloudWatch::Dashboard
+  #   Properties:
+  #     DashboardName: event-processor-dashboard
+  #     DashboardBody: !Sub |
+  #       {
+  #         "widgets": [
+  #           {
+  #             "type": "metric",
+  #             "x": 0, "y": 0, "width": 12, "height": 6,
+  #             "properties": {
+  #               "metrics": [
+  #                 [ "AWS/Lambda", "Invocations", "FunctionName", "${EventProcessorFunction}" ],
+  #                 [ ".", "Errors", ".", "." ]
+  #               ],
+  #               "period": 300,
+  #               "stat": "Sum",
+  #               "title": "Lambda Invocations & Errors"
+  #             }
+  #           },
+  #           {
+  #             "type": "metric",
+  #             "x": 0, "y": 6, "width": 12, "height": 6,
+  #             "properties": {
+  #               "metrics": [
+  #                 [ "AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", "${EventQueue}" ],
+  #                 [ ".", "ApproximateNumberOfMessagesVisible", "QueueName", "${EventDLQ}" ]
+  #               ],
+  #               "period": 300,
+  #               "stat": "Sum",
+  #               "title": "SQS Queue Depths"
+  #             }
+  #           },
+  #           {
+  #             "type": "metric",
+  #             "x": 12, "y": 0, "width": 12, "height": 6,
+  #             "properties": {
+  #               "metrics": [
+  #                 [ "AWS/DynamoDB", "ConsumedReadCapacityUnits", "TableName", "${EventTable}" ]
+  #               ],
+  #               "period": 300,
+  #               "stat": "Sum",
+  #               "title": "DynamoDB Read Capacity (consumed)"
+  #             }
+  #           }
+  #         ]
+  #       }
+
+Outputs:
+  QueueUrl:
+    Description: URL of the Event Queue
+    Value: !Ref EventQueue
+    Export:
+      Name: EventQueueUrl
+
+  QueueArn:
+    Description: ARN of the Event Queue
+    Value: !GetAtt EventQueue.Arn
+    Export:
+      Name: EventQueueArn
+
+  DLQUrl:
+    Description: URL of the Dead Letter Queue
+    Value: !Ref EventDLQ
+    Export:
+      Name: EventDLQUrl
+
+  EventTableName:
+    Description: DynamoDB table name
+    Value: !Ref EventTable
+    Export:
+      Name: EventTableName
+  
+  EventTableStreamArn:
+    Description: DynamoDB Stream ARN for the Event Table
+    Value: !GetAtt EventTable.StreamArn
+    Export:
+      Name: EventTableStreamArn
+  
+  EventTableReadPolicyArn:
+    Description: Managed IAM Policy ARN for read-only access to Event Table
+    Value: !Ref EventTableReadPolicy
+    Export:
+      Name: EventTableReadPolicyArn
+
+  KmsKeyArn:
+    Description: KMS Key ARN for event resources
+    Value: !GetAtt EventKMSKey.Arn
+    Export:
+      Name: EventKmsKeyArn
