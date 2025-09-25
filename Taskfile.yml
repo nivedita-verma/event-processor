@@ -1,0 +1,135 @@
+# https://taskfile.dev
+
+version: '3'
+
+dotenv: ['eventprocessor.env']
+
+tasks:
+  default:
+    cmds:
+      - task: build
+      - task: deploy
+
+  localstack-up:
+    desc: "Start LocalStack in Docker"
+    cmds:
+      - localstack start -d
+
+  localstack-init:
+    desc: "Create S3 bucket for SAM packaging in LocalStack"
+    cmds:
+      - export AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_DEFAULT_REGION=${REGION}
+      - aws --endpoint-url=http://localhost:4566 s3 mb s3://${LOCALSTACK_DEPLOYMENT_BUCKET}
+
+  localstack:
+    desc: "Build, package, and deploy SAM stack to LocalStack"
+    cmds:
+      - task: build-lambda
+      - task: package-sam
+        vars:
+          DEPLOYMENT_BUCKET: '{{.LOCALSTACK_DEPLOYMENT_BUCKET}}'
+          DEPLOY_ENV: 'localstack'
+      - task: deploy-sam
+        vars:
+          DEPLOY_ENV: 'localstack'
+
+  localstack-down:
+    desc: "Stop LocalStack Docker container"
+    cmds:
+      - localstack stop
+  
+  build:
+    cmds:
+      - task: build-lambda
+  
+  deploy:
+    cmds:
+      - task: package-sam
+        vars:
+          DEPLOYMENT_BUCKET: '{{.AWS_DEPLOYMENT_BUCKET}}'
+      - task: deploy-sam
+  
+  init:
+    cmds:
+      - aws s3 mb s3://${AWS_DEPLOYMENT_BUCKET}
+      - aws s3api put-bucket-versioning --bucket ${AWS_DEPLOYMENT_BUCKET} --versioning-configuration Status=Enabled
+
+  build-lambda:
+    desc: "Compile Go Lambda for linux/amd64"
+    cmds:
+      - echo "Building Lambda binary..."
+      - GOOS=linux GOARCH=amd64 go build -o build/event-processor/bootstrap cmd/event-processor/main.go
+
+  package-sam:
+    desc: "Package SAM template"
+    cmds:
+      - echo "Packaging SAM template..."
+      - mkdir -p build/deployment
+      - |
+        if [ "{{.DEPLOY_ENV}}" = "localstack" ]; then
+          AWS_ACCESS_KEY_ID=test \
+          AWS_SECRET_ACCESS_KEY=test \
+          AWS_DEFAULT_REGION={{.REGION}} \
+          AWS_ENDPOINT_URL=http://localhost:4566 \
+          sam package \
+            --template-file deployment/template.yml \
+            --s3-bucket {{.DEPLOYMENT_BUCKET}} \
+            --output-template-file build/deployment/template.yml
+        else
+          sam package \
+            --template-file deployment/template.yml \
+            --s3-bucket {{.DEPLOYMENT_BUCKET}} \
+            --output-template-file build/deployment/template.yml \
+            --region {{.REGION}}
+        fi
+
+  deploy-sam:
+    desc: "Deploy SAM stack"
+    cmds:
+      - echo "Deploying SAM stack..."
+      - |
+        if [ "{{.DEPLOY_ENV}}" = "localstack" ]; then
+          AWS_ACCESS_KEY_ID=test \
+          AWS_SECRET_ACCESS_KEY=test \
+          AWS_DEFAULT_REGION={{.REGION}} \
+          AWS_ENDPOINT_URL=http://localhost:4566 \
+          sam deploy \
+            --template-file build/deployment/template.yml \
+            --stack-name {{.STACK_NAME}} \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --region {{.REGION}} \
+            --no-fail-on-empty-changeset \
+            --no-confirm-changeset
+        else
+          sam deploy \
+            --template-file build/deployment/template.yml \
+            --stack-name {{.STACK_NAME}} \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --region {{.REGION}} \
+            --no-fail-on-empty-changeset \
+            --no-confirm-changeset
+        fi
+
+  delete:
+    desc: "Delete stack and its resources"
+    cmds:
+      - echo "Deleting stack..."
+      - |
+        aws cloudformation delete-stack \
+          --stack-name event-processor \
+          --region eu-west-2
+
+  test:
+    desc: "Run unit tests with coverage"
+    cmds:
+      - echo "Running unit tests..."
+      - grep -v 'cmd' coverage.out > coverage.filtered.out
+      - go tool cover -func=coverage.filtered.out
+
+  run-simulator:
+    desc: "Build and run the event simulator"
+    cmds:
+      - echo "Building simulator..."
+      - go build -o build/event-simulator cmd/event-simulator/main.go
+      - echo "Running simulator..."
+      - ./build/event-simulator
