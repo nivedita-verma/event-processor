@@ -1,7 +1,7 @@
 # Event Processor
 
 [Overview](#overview)  
-[Architecture and Design Considerations](architecture.md)  
+[Architecture and Design Considerations](./documentation/architecture.md)  
 [AWS Deployment](#aws-deployment)  
 [LocalStack Deployment](#localstack-deployment)
 
